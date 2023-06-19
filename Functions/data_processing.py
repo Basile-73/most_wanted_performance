@@ -1,13 +1,8 @@
 import pytz
 import datetime
 import pandas as pd
-from Functions.email_manager import retrieve_attachments, move_messages_to_used_folder
 from datetime import timedelta, datetime, timezone
 from Functions.locations import Locations
-import psycopg2
-from psycopg2 import sql
-import streamlit
-from sqlalchemy import create_engine
 from fastapi import FastAPI
 from typing import Union
 
@@ -24,24 +19,11 @@ def convert_to_datetime(date_string):
 
 def get_clean_df(df_dirty):
     # Removes empty rows at the top & renames columns
-    df_dirty.columns = df_dirty.iloc[3]
-    df_cut = df_dirty[4:]
-    transactions = df_cut[['Asset Id', 'Asset Description', 'Asset SKU', 'User Name', 'Action Type', 'Device Name', 'Action Date']].copy()
+    transactions = df_dirty[['Asset Id', 'Asset Description', 'Asset SKU', 'User Name', 'Action Type', 'Device Name', 'Action Date']].copy()
     transactions['Action Date'] = transactions['Action Date'].apply(convert_to_datetime).astype(str)
     #transactions['Action Date'] = transactions['Action Date'].apply(convert_to_datetime).apply(lambda dt: dt.astimezone(timezone.utc))
     #transactions['Action Date'] = transactions['Action Date'].astype(str)
     return transactions
-
-def save_to_db(df, table_name):
-    engine = create_engine(f'postgresql://{streamlit.secrets["postgres"]["user"]}:{streamlit.secrets["postgres"]["password"]}@{streamlit.secrets["postgres"]["host"]}:{streamlit.secrets["postgres"]["port"]}/{streamlit.secrets["postgres"]["dbname"]}')
-
-    df.reset_index(drop=True, inplace=True)
-    if 'index' in df.columns:
-        df = df.drop('index', axis=1)
-    if 'level_0' in df.columns:
-        df = df.drop('level_0', axis=1)
-
-    df.to_sql(table_name, engine, if_exists='replace', index=False)
 
 import os
 
@@ -53,44 +35,6 @@ class AssetManager:
         self.Location = location
         self.Tool_status = None
         self.Overdue = None
-        self.table_name = 'tool_status'
-
-    def update_overdue(self):
-    # Computes the list of Overdue Tools and stores it in self.Overdue
-        self.load_transactions()
-        self.update_tool_status()
-        self.get_overdue()
-        move_messages_to_used_folder()
-        save_to_db(self.Tool_status, 'tool_status')
-
-
-    def load_transactions(self):
-        # db connection
-        connection = psycopg2.connect(
-        host=streamlit.secrets["postgres"]["host"],
-        port=streamlit.secrets["postgres"]["port"],
-        dbname=streamlit.secrets["postgres"]["dbname"],
-        user=streamlit.secrets["postgres"]["user"],
-        password=streamlit.secrets["postgres"]["password"]
-    )
-
-        cursor = connection.cursor()
-        cursor.execute("SELECT EXISTS(SELECT * FROM information_schema.tables WHERE table_name=%s)", ('tool_status',))
-        # Consider 2 Sources
-        # 1: Database with inital transactions or tool_status
-        if cursor.fetchone()[0]:
-            # Table exists: Load data from PostgreSQL table
-            select_query = sql.SQL("SELECT * FROM {}").format(sql.Identifier(self.table_name))
-            cursor.execute(select_query)
-
-            initial_transactions = pd.DataFrame(cursor.fetchall(), columns=[desc[0] for desc in cursor.description])
-            self.Transactions_records.append(initial_transactions)
-        else:
-            print("Could not reach database")
-        # 2: Excel files from Attachment
-        attachments = retrieve_attachments()
-        for attachment in attachments:
-            self.Transactions_records.append(get_clean_df(attachment))
 
     def update_tool_status(self):
         # concatenate all dataframes in the list into one
@@ -104,13 +48,18 @@ class AssetManager:
         combined_df['Action Date'] = combined_df['Action Date'].astype(str)
         self.Tool_status = combined_df
 
-    def get_overdue(self):
+    def get_overdue(self, now):
     # Filters and displays overdue Tools from the Tool_Status List
         self.Overdue = self.Tool_status.copy()
         self.Overdue = self.Overdue[self.Overdue['Action Type']=="CHECK_OUT"]
         self.Overdue = self.Overdue[self.Overdue['Device Name'].isin(Locations[self.Location])]
         self.Overdue['Action Date'] = self.Overdue['Action Date'].apply(lambda x: pd.to_datetime(x))
-        now = datetime.now(pytz.utc)
+        # now comes in as a date: e.g. 14.07.2021. Add a time (6 p.m.) to it: e.g. 14.07.2021 18:00:00
+        now = datetime.strptime(now, '%d-%m-%Y')
+        now = now.replace(hour=18, minute=0, second=0)
+        now = now.replace(tzinfo=pytz.UTC)  # This makes it UTC timezone aware
+        # Convert to Salt Lake City time ('America/Denver' in pytz)
+        now = now.astimezone(pytz.timezone('America/Denver'))
         self.Overdue.loc[:, 'Out since (h)'] = self.Overdue['Action Date'].apply(lambda x: (now - x).total_seconds() / 3600).round().astype(int)
         #self.Overdue.loc[:, 'Out since (h)'] = self.Overdue['Action Date'].apply(lambda x: int((now - x) / timedelta(hours=1)))
         self.Overdue = self.Overdue[self.Overdue['Out since (h)'] > self.Lending_period]
